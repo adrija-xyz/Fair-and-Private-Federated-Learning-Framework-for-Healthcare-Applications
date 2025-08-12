@@ -5,12 +5,11 @@ import torch.nn.functional as F
 class CNN(nn.Module):
     def __init__(self):
         super(CNN, self).__init__()
-        self.conv1 = nn.Conv2d(3, 32, kernel_size=3)      # RGB input
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3)
         self.pool = nn.MaxPool2d(2)
         self.dropout1 = nn.Dropout(0.25)
 
-        # Dynamically determine the flattened dimension
         with torch.no_grad():
             dummy_input = torch.zeros(1, 3, 28, 28)
             dummy_output = self.pool(F.relu(self.conv2(F.relu(self.conv1(dummy_input)))))
