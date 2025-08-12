@@ -14,6 +14,17 @@ import pandas as pd
 import random
 import copy
 
+# ---------------------------- Device ---------------------------- #
+device = (
+    torch.device("cuda") if torch.cuda.is_available()
+    else torch.device("mps") if hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+    else torch.device("cpu")
+)
+if device.type == "cuda":
+    torch.backends.cudnn.benchmark = True
+pinmem = device.type == "cuda"
+
+# ---------------------------- Results / CSV ---------------------------- #
 SCENARIO = "Non-IID"
 RESULTS_DIR = "./results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -23,6 +34,7 @@ MACRO_CSV = os.path.join(RESULTS_DIR, f"macro_{SCENARIO}.csv")
 def append_df_to_csv(path, df):
     df.to_csv(path, mode="a", index=False, header=not os.path.exists(path))
 
+# ---------------------------- Partitions ---------------------------- #
 def create_noniid_shards(dataset, num_clients=10, shards_per_client=2, total_samples=60000):
     labels = np.array(dataset.targets)
     shuffled_indices = np.random.permutation(len(labels))
@@ -77,6 +89,7 @@ def create_hybrid_partition_variable_shards(
     client_datasets = [Subset(dataset, indices) for indices in all_client_indices]
     return client_datasets
 
+# ---------------------------- Data ---------------------------- #
 transform = transforms.Compose([transforms.ToTensor()])
 mnist_train = datasets.MNIST("./data", train=True, download=True, transform=transform)
 mnist_test = datasets.MNIST("./data", train=False, download=True, transform=transform)
@@ -84,35 +97,50 @@ mnist_test = datasets.MNIST("./data", train=False, download=True, transform=tran
 num_clients = 20
 client_datasets = create_noniid_shards(mnist_train, num_clients, shards_per_client=6, total_samples=60000)
 
+# Aux loader: 10 samples per class from test set
 aux_indices = []
 labels_test = np.array(mnist_test.targets)
 for cls in range(10):
     aux_indices.extend(np.where(labels_test == cls)[0][:10])
-aux_loader = DataLoader(Subset(mnist_test, aux_indices), batch_size=32, shuffle=False)
+aux_loader = DataLoader(Subset(mnist_test, aux_indices), batch_size=32, shuffle=False, pin_memory=pinmem)
 
+# ---------------------------- Metrics ---------------------------- #
 def compute_metrics(y_true, y_pred, average="macro"):
     acc = accuracy_score(y_true, y_pred)
     prec, rec, f1, _ = precision_recall_fscore_support(y_true, y_pred, average=average, zero_division=0)
     return acc, prec, rec, f1
 
-global_class_counts = np.zeros(10)
+global_class_counts = np.zeros(10, dtype=np.float64)
 
-def compute_class_distribution(model):
+# ---------------------------- Reward Components ---------------------------- #
+def compute_class_distribution(model, device):
+    """Compute R (class distribution proxy) via per-class gradient norms on aux set."""
     model.eval()
     criterion = torch.nn.CrossEntropyLoss(reduction='none')
-    class_grad_norms = np.zeros(10)
-    class_counts = np.zeros(10)
+    class_grad_norms = np.zeros(10, dtype=np.float64)
+    class_counts = np.zeros(10, dtype=np.float64)
+
     for data, target in aux_loader:
-        model.zero_grad()
+        data = data.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True)
+        model.zero_grad(set_to_none=True)
         output = model(data)
         loss = criterion(output, target)
+        # Per-sample loss -> per-class grad norm
         for idx in range(len(target)):
+            model.zero_grad(set_to_none=True)
             loss[idx].backward(retain_graph=True)
-            grad = torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None])
-            class_grad_norms[target[idx].item()] += torch.norm(grad).item()
-            class_counts[target[idx].item()] += 1
-            model.zero_grad()
-    avg_grad_norms = class_grad_norms / np.maximum(class_counts, 1)
+            grads = []
+            for p in model.parameters():
+                if p.grad is not None:
+                    grads.append(p.grad.detach())
+            if grads:
+                grad = torch.cat([g.flatten() for g in grads])
+                cls = int(target[idx].item())
+                class_grad_norms[cls] += torch.norm(grad).item()
+                class_counts[cls] += 1
+
+    avg_grad_norms = class_grad_norms / np.maximum(class_counts, 1.0)
     beta = 1.0
     exp_norms = np.exp(beta * avg_grad_norms)
     R = exp_norms / np.sum(exp_norms)
@@ -122,6 +150,7 @@ def compute_kl_divergence(R):
     U = np.ones_like(R) / len(R)
     return np.sum(R * np.log(R / (U + 1e-12) + 1e-12))
 
+# ---------------------------- Strategy ---------------------------- #
 class FedCIR_MAB_KL(FedAvg):
     def __init__(self, num_clusters=5, epsilon=0.1, lambda_weight=0.7, noise_std=0.1, max_clip_norm=1.0, **kwargs):
         super().__init__(**kwargs)
@@ -146,7 +175,12 @@ class FedCIR_MAB_KL(FedAvg):
         if self.client_distributions:
             dist_matrix = np.array(list(self.client_distributions.values()))
             cids = list(self.client_distributions.keys())
-            cluster_labels = KMeans(n_clusters=self.num_clusters, n_init="auto").fit_predict(dist_matrix)
+            # KMeans (handle n_init API differences across sklearn versions)
+            try:
+                cluster_labels = KMeans(n_clusters=self.num_clusters, n_init="auto").fit_predict(dist_matrix)
+            except TypeError:
+                cluster_labels = KMeans(n_clusters=self.num_clusters, n_init=10).fit_predict(dist_matrix)
+
             selected_cids = []
             for cluster in range(self.num_clusters):
                 cluster_cids = [cid for cid, label in zip(cids, cluster_labels) if label == cluster]
@@ -160,6 +194,7 @@ class FedCIR_MAB_KL(FedAvg):
                     cluster_rewards.sort(key=lambda x: x[1], reverse=True)
                     selected = [cid for cid, _ in cluster_rewards[:n_select]]
                 selected_cids.extend(selected)
+
             if not selected_cids:
                 clients = client_manager.sample(num_clients=self.min_fit_clients, min_num_clients=self.min_fit_clients)
             else:
@@ -177,41 +212,56 @@ class FedCIR_MAB_KL(FedAvg):
         clients = client_manager.sample(num_clients=self.min_evaluate_clients, min_num_clients=self.min_evaluate_clients)
         return [(client, EvaluateIns(parameters, {"server_round": server_round})) for client in clients]
 
+# ---------------------------- Flower Client ---------------------------- #
 class FlowerClient(fl.client.NumPyClient):
-    def __init__(self, cid, model, train_loader, strategy):
+    def __init__(self, cid, model, train_loader, strategy, device):
         self.cid = cid
-        self.model = model
+        self.model = model.to(device)
         self.train_loader = train_loader
         self.strategy = strategy
+        self.device = device
 
     def get_parameters(self, config=None):
-        return [val.cpu().numpy() for val in self.model.state_dict().values()]
+        # Flower expects NumPy (CPU)
+        return [p.detach().cpu().numpy() for p in self.model.state_dict().values()]
 
     def set_parameters(self, parameters):
         state_dict = self.model.state_dict()
         for k, v in zip(state_dict.keys(), parameters):
-            state_dict[k] = torch.tensor(v)
+            state_dict[k] = torch.tensor(v, device=self.device)
         self.model.load_state_dict(state_dict)
+        self.model.to(self.device)
 
     def fit(self, parameters, config=None):
         self.set_parameters(parameters)
         self.model.train()
         optimizer = torch.optim.SGD(self.model.parameters(), lr=0.01)
-        global_params = [param.clone().detach() for param in self.model.parameters()]
+
+        # FedProx regularization
+        global_params = [p.detach().clone() for p in self.model.parameters()]
         mu = 0.01
 
-        local_class_counts = np.zeros(10)
+        local_class_counts = np.zeros(10, dtype=np.float64)
+
         for data, target in self.train_loader:
+            data = data.to(self.device, non_blocking=True)
+            target = target.to(self.device, non_blocking=True)
+
             optimizer.zero_grad()
             output = self.model(data)
             loss = F.cross_entropy(output, target)
-            prox_reg = sum(((param - global_param) ** 2).sum() for param, global_param in zip(self.model.parameters(), global_params))
-            loss += (mu / 2) * prox_reg
+
+            prox_reg = sum(((p - gp) ** 2).sum() for p, gp in zip(self.model.parameters(), global_params))
+            loss = loss + (mu / 2) * prox_reg
+
             loss.backward()
             optimizer.step()
-            for cls in target.numpy():
-                local_class_counts[cls] += 1
 
+            # Count per-class on CPU
+            for cls in target.detach().cpu().numpy():
+                local_class_counts[int(cls)] += 1
+
+        # --- reward bookkeeping ---
         global global_class_counts
         global_class_counts = global_class_counts + local_class_counts
 
@@ -221,7 +271,7 @@ class FlowerClient(fl.client.NumPyClient):
         prop = local_class_counts / (total_local + 1e-6)
         rare_class_score = float((prop * w_c).sum())
 
-        R = compute_class_distribution(self.model)
+        R = compute_class_distribution(self.model, self.device)
         kl_div = compute_kl_divergence(R)
         lambda_weight = self.strategy.lambda_weight
         composite_reward = lambda_weight * kl_div + (1 - lambda_weight) * rare_class_score
@@ -230,7 +280,8 @@ class FlowerClient(fl.client.NumPyClient):
         self.strategy.client_rewards[self.cid] = composite_reward
         self.strategy.client_counts[self.cid] = self.strategy.client_counts.get(self.cid, 0) + 1
 
-        updated_params = self.get_parameters()
+        # DP clipping/noise on CPU numpy arrays (Flower wants numpy)
+        updated_params = self.get_parameters()  # numpy on CPU
         total_norm = np.sqrt(sum(np.sum(p**2) for p in updated_params))
         clip_coef = min(1.0, self.strategy.max_clip_norm / (total_norm + 1e-6))
         clipped_params = [p * clip_coef for p in updated_params]
@@ -246,11 +297,13 @@ class FlowerClient(fl.client.NumPyClient):
 
         with torch.no_grad():
             for data, target in aux_loader:
+                data = data.to(self.device, non_blocking=True)
+                target = target.to(self.device, non_blocking=True)
                 output = self.model(data)
                 loss_sum += F.cross_entropy(output, target, reduction='sum').item()
                 pred = output.argmax(dim=1)
-                y_true.extend(target.cpu().numpy().tolist())
-                y_pred.extend(pred.cpu().numpy().tolist())
+                y_true.extend(target.detach().cpu().numpy().tolist())
+                y_pred.extend(pred.detach().cpu().numpy().tolist())
                 total += target.size(0)
 
         avg_loss = loss_sum / max(total, 1)
@@ -280,11 +333,18 @@ class FlowerClient(fl.client.NumPyClient):
 
         return avg_loss, total, {"accuracy": acc, "precision": prec, "recall": rec, "f1": f1}
 
+# ---------------------------- Client fn ---------------------------- #
 def client_fn(cid: str):
-    model = CNN()
-    train_loader = DataLoader(client_datasets[int(cid)], batch_size=32, shuffle=True)
-    return FlowerClient(cid, model, train_loader, strategy).to_client()
+    model = CNN().to(device)
+    train_loader = DataLoader(
+        client_datasets[int(cid)],
+        batch_size=32,
+        shuffle=True,
+        pin_memory=pinmem
+    )
+    return FlowerClient(cid, model, train_loader, strategy, device).to_client()
 
+# ---------------------------- Main ---------------------------- #
 if __name__ == "__main__":
     strategy = FedCIR_MAB_KL(
         fraction_fit=0.2,
@@ -295,15 +355,20 @@ if __name__ == "__main__":
         lambda_weight=0.7,
         noise_std=0.001,
         max_clip_norm=5.0,
-        fraction_evaluate=0.2,       
+        fraction_evaluate=0.2,
         min_evaluate_clients=2
     )
+
+    client_resources = {"num_cpus": 1}
+    # Ray GPU scheduling (CUDA only); MPS isn't visible to Ray as a GPU resource.
+    if device.type == "cuda":
+        client_resources["num_gpus"] = 1  # or a fraction like 0.25 if memory allows concurrency
 
     fl.simulation.start_simulation(
         client_fn=client_fn,
         num_clients=num_clients,
         config=fl.server.ServerConfig(num_rounds=500),
-        client_resources={"num_cpus": 1},
+        client_resources=client_resources,
         strategy=strategy
     )
 
@@ -315,22 +380,27 @@ if __name__ == "__main__":
     else:
         raise RuntimeError("No final global parameters found in strategy.")
 
-    global_model = CNN()
+    global_model = CNN().to(device)
     state_dict = global_model.state_dict()
     for k, v in zip(state_dict.keys(), final_parameters):
-        state_dict[k] = torch.tensor(v)
+        state_dict[k] = torch.tensor(v, device=device)
     global_model.load_state_dict(state_dict)
 
     global_model.eval()
     y_true, y_pred = [], []
     loss_sum, total = 0.0, 0
+
+    test_loader = DataLoader(mnist_test, batch_size=64, shuffle=False, pin_memory=pinmem)
+
     with torch.no_grad():
-        for data, target in DataLoader(mnist_test, batch_size=64):
+        for data, target in test_loader:
+            data = data.to(device, non_blocking=True)
+            target = target.to(device, non_blocking=True)
             output = global_model(data)
             loss_sum += F.cross_entropy(output, target, reduction='sum').item()
             pred = output.argmax(dim=1)
-            y_true.extend(target.cpu().numpy().tolist())
-            y_pred.extend(pred.cpu().numpy().tolist())
+            y_true.extend(target.detach().cpu().numpy().tolist())
+            y_pred.extend(pred.detach().cpu().numpy().tolist())
             total += target.size(0)
 
     avg_loss = loss_sum / total
@@ -341,7 +411,7 @@ if __name__ == "__main__":
 
     global_cw = pd.DataFrame({
         "scenario": [SCENARIO]*len(prec_arr),
-        "round": [50]*len(prec_arr),   
+        "round": [50]*len(prec_arr),  # keep as in your original; change if you want actual last round
         "class": list(range(len(prec_arr))),
         "precision": prec_arr,
         "recall": rec_arr,

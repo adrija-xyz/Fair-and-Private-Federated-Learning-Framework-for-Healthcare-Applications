@@ -11,7 +11,11 @@ import torch
 import torch.nn.functional as F
 import pandas as pd
 
-SCENARIO = "Baseline-Random-DP" 
+# --------------------- Device --------------------- #
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", DEVICE)
+
+SCENARIO = "Baseline-Random-DP"
 RESULTS_DIR = "./results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 CLASSWISE_CSV = os.path.join(RESULTS_DIR, f"classwise_{SCENARIO}.csv")
@@ -87,7 +91,7 @@ aux_indices = []
 labels_test = np.array(mnist_test.targets)
 for cls in range(10):
     aux_indices.extend(np.where(labels_test == cls)[0][:10])
-aux_loader = DataLoader(Subset(mnist_test, aux_indices), batch_size=32, shuffle=False)
+aux_loader = DataLoader(Subset(mnist_test, aux_indices), batch_size=32, shuffle=False, pin_memory=True)
 
 def compute_metrics(y_true, y_pred, average="macro"):
     acc = accuracy_score(y_true, y_pred)
@@ -129,17 +133,18 @@ class BaselineRandomDP(FedAvg):
 class FlowerClient(fl.client.NumPyClient):
     def __init__(self, cid, model, train_loader, strategy: BaselineRandomDP):
         self.cid = cid
-        self.model = model
+        self.model = model.to(DEVICE)  # keep model on GPU/CPU
         self.train_loader = train_loader
-        self.strategy = strategy 
+        self.strategy = strategy
 
     def get_parameters(self, config=None):
-        return [val.cpu().numpy() for val in self.model.state_dict().values()]
+        # convert to CPU numpy only when sending to server
+        return [val.detach().cpu().numpy() for val in self.model.state_dict().values()]
 
     def set_parameters(self, parameters):
         state_dict = self.model.state_dict()
         for k, v in zip(state_dict.keys(), parameters):
-            state_dict[k] = torch.tensor(v)
+            state_dict[k] = torch.tensor(v, device=DEVICE)  # load tensors onto device
         self.model.load_state_dict(state_dict)
 
     def fit(self, parameters, config=None):
@@ -147,10 +152,13 @@ class FlowerClient(fl.client.NumPyClient):
         self.model.train()
         optimizer = torch.optim.SGD(self.model.parameters(), lr=0.01)
 
-        global_params = [param.clone().detach() for param in self.model.parameters()]
+        global_params = [param.clone().detach() for param in self.model.parameters()]  # on DEVICE
         mu = 0.01
 
         for data, target in self.train_loader:
+            data = data.to(DEVICE, non_blocking=True)
+            target = target.to(DEVICE, non_blocking=True)
+
             optimizer.zero_grad()
             output = self.model(data)
             loss = F.cross_entropy(output, target)
@@ -161,15 +169,11 @@ class FlowerClient(fl.client.NumPyClient):
 
         updated_params = self.get_parameters()
 
+        # DP clipping & noise on numpy arrays (OK to stay on CPU here)
         total_norm = np.sqrt(sum(np.sum(p**2) for p in updated_params))
         clip_coef = min(1.0, self.strategy.max_clip_norm / (total_norm + 1e-6))
-
         clipped_params = [p * clip_coef for p in updated_params]
-
-        noisy_params = [
-            p + np.random.normal(0.0, self.strategy.noise_std, size=p.shape)
-            for p in clipped_params
-        ]
+        noisy_params = [p + np.random.normal(0.0, self.strategy.noise_std, size=p.shape) for p in clipped_params]
 
         return noisy_params, len(self.train_loader.dataset), {}
 
@@ -181,11 +185,15 @@ class FlowerClient(fl.client.NumPyClient):
 
         with torch.no_grad():
             for data, target in aux_loader:
+                data = data.to(DEVICE, non_blocking=True)
+                target = target.to(DEVICE, non_blocking=True)
+
                 output = self.model(data)
                 loss_sum += F.cross_entropy(output, target, reduction='sum').item()
                 pred = output.argmax(dim=1)
-                y_true.extend(target.cpu().numpy().tolist())
-                y_pred.extend(pred.cpu().numpy().tolist())
+
+                y_true.extend(target.detach().cpu().numpy().tolist())
+                y_pred.extend(pred.detach().cpu().numpy().tolist())
                 total += target.size(0)
 
         avg_loss = loss_sum / max(total, 1)
@@ -219,19 +227,23 @@ class FlowerClient(fl.client.NumPyClient):
         return avg_loss, total, {"accuracy": acc, "precision": prec, "recall": rec, "f1": f1}
 
 def client_fn(cid: str):
-    model = CNN()
-    train_loader = DataLoader(client_datasets[int(cid)], batch_size=32, shuffle=True)
+    model = CNN().to(DEVICE)  # create model on device
+    train_loader = DataLoader(
+        client_datasets[int(cid)],
+        batch_size=32, shuffle=True,
+        pin_memory=True  # faster host->GPU copies
+    )
     return FlowerClient(cid, model, train_loader, strategy).to_client()
 
 if __name__ == "__main__":
     strategy = BaselineRandomDP(
-        fraction_fit=0.2,             
+        fraction_fit=0.2,
         min_fit_clients=2,
         min_available_clients=num_clients,
         fraction_evaluate=0.2,
         min_evaluate_clients=2,
-        noise_std=0.001,              
-        max_clip_norm=5.0,            
+        noise_std=0.001,
+        max_clip_norm=5.0,
     )
 
     fl.simulation.start_simulation(
@@ -250,22 +262,26 @@ if __name__ == "__main__":
     else:
         raise RuntimeError("No final global parameters found in strategy.")
 
-    global_model = CNN()
+    global_model = CNN().to(DEVICE)
     state_dict = global_model.state_dict()
     for k, v in zip(state_dict.keys(), final_parameters):
-        state_dict[k] = torch.tensor(v)
+        state_dict[k] = torch.tensor(v, device=DEVICE)  # load on device
     global_model.load_state_dict(state_dict)
 
     global_model.eval()
     y_true, y_pred = [], []
     loss_sum, total = 0.0, 0
     with torch.no_grad():
-        for data, target in DataLoader(mnist_test, batch_size=64):
+        for data, target in DataLoader(mnist_test, batch_size=64, pin_memory=True):
+            data = data.to(DEVICE, non_blocking=True)
+            target = target.to(DEVICE, non_blocking=True)
+
             output = global_model(data)
             loss_sum += F.cross_entropy(output, target, reduction='sum').item()
             pred = output.argmax(dim=1)
-            y_true.extend(target.cpu().numpy().tolist())
-            y_pred.extend(pred.cpu().numpy().tolist())
+
+            y_true.extend(target.detach().cpu().numpy().tolist())
+            y_pred.extend(pred.detach().cpu().numpy().tolist())
             total += target.size(0)
 
     avg_loss = loss_sum / total
@@ -278,7 +294,7 @@ if __name__ == "__main__":
 
     global_cw = pd.DataFrame({
         "scenario": [SCENARIO]*len(prec_arr),
-        "round": [50]*len(prec_arr),  
+        "round": [50]*len(prec_arr),
         "class": list(range(len(prec_arr))),
         "precision": prec_arr,
         "recall": rec_arr,
