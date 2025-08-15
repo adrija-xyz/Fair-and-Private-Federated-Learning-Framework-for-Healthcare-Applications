@@ -11,7 +11,6 @@ import torch
 import torch.nn.functional as F
 import pandas as pd
 
-# --------------------- Device --------------------- #
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", DEVICE)
 
@@ -99,7 +98,6 @@ def compute_metrics(y_true, y_pred, average="macro"):
     return acc, prec, rec, f1
 
 class BaselineRandomDP(FedAvg):
-    """FedAvg with random client selection and client-side DP (clip + Gaussian noise)."""
     def __init__(self, noise_std=0.001, max_clip_norm=5.0, **kwargs):
         super().__init__(**kwargs)
         self.client_participation = {}
@@ -133,18 +131,17 @@ class BaselineRandomDP(FedAvg):
 class FlowerClient(fl.client.NumPyClient):
     def __init__(self, cid, model, train_loader, strategy: BaselineRandomDP):
         self.cid = cid
-        self.model = model.to(DEVICE)  # keep model on GPU/CPU
+        self.model = model.to(DEVICE)
         self.train_loader = train_loader
         self.strategy = strategy
 
     def get_parameters(self, config=None):
-        # convert to CPU numpy only when sending to server
         return [val.detach().cpu().numpy() for val in self.model.state_dict().values()]
 
     def set_parameters(self, parameters):
         state_dict = self.model.state_dict()
         for k, v in zip(state_dict.keys(), parameters):
-            state_dict[k] = torch.tensor(v, device=DEVICE)  # load tensors onto device
+            state_dict[k] = torch.tensor(v, device=DEVICE)
         self.model.load_state_dict(state_dict)
 
     def fit(self, parameters, config=None):
@@ -169,7 +166,6 @@ class FlowerClient(fl.client.NumPyClient):
 
         updated_params = self.get_parameters()
 
-        # DP clipping & noise on numpy arrays (OK to stay on CPU here)
         total_norm = np.sqrt(sum(np.sum(p**2) for p in updated_params))
         clip_coef = min(1.0, self.strategy.max_clip_norm / (total_norm + 1e-6))
         clipped_params = [p * clip_coef for p in updated_params]
@@ -227,11 +223,11 @@ class FlowerClient(fl.client.NumPyClient):
         return avg_loss, total, {"accuracy": acc, "precision": prec, "recall": rec, "f1": f1}
 
 def client_fn(cid: str):
-    model = CNN().to(DEVICE)  # create model on device
+    model = CNN().to(DEVICE)
     train_loader = DataLoader(
         client_datasets[int(cid)],
         batch_size=32, shuffle=True,
-        pin_memory=True  # faster host->GPU copies
+        pin_memory=True
     )
     return FlowerClient(cid, model, train_loader, strategy).to_client()
 
@@ -265,7 +261,7 @@ if __name__ == "__main__":
     global_model = CNN().to(DEVICE)
     state_dict = global_model.state_dict()
     for k, v in zip(state_dict.keys(), final_parameters):
-        state_dict[k] = torch.tensor(v, device=DEVICE)  # load on device
+        state_dict[k] = torch.tensor(v, device=DEVICE)
     global_model.load_state_dict(state_dict)
 
     global_model.eval()

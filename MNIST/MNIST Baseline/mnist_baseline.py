@@ -90,7 +90,6 @@ aux_indices = []
 labels_test = np.array(mnist_test.targets)
 for cls in range(10):
     aux_indices.extend(np.where(labels_test == cls)[0][:10])
-# pin_memory helps when moving to GPU
 aux_loader = DataLoader(Subset(mnist_test, aux_indices), batch_size=32, shuffle=False, pin_memory=True)
 
 def compute_metrics(y_true, y_pred, average="macro"):
